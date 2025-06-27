@@ -1,6 +1,6 @@
 using LinearAlgebra
 using NbodyGradient
-using NbodyGradient: get_relative_masses, get_relative_positions
+using NbodyGradient: hierarchy, amatrix
 using NbodyGradient: Point
 
 mag(x) = sqrt(dot(x,x))
@@ -14,7 +14,7 @@ end
 
 using LinearAlgebra
 
-function convert_to_elements(x::Vector{T}, v::Vector{T}, Gm::T, t::T) where T <: AbstractFloat
+function convert_to_elements(x::Vector{T}, v::Vector{T}, Gm::T, t::T) where T <: Real
     R = norm(x)
     v2 = dot(v, v)
     hvec = cross(x, v)
@@ -30,14 +30,24 @@ function convert_to_elements(x::Vector{T}, v::Vector{T}, Gm::T, t::T) where T <:
     I = acos(clamp(hvec[3] / h, -1, 1))
 
     # (2.137) -check sign convention with eric
-    sinΩ = hvec[1] / (h * sin(I))
-    cosΩ = -hvec[2] / (h * sin(I))
-    Ω = atan(sinΩ, cosΩ)
+    if abs(I) >= 1e-8
+        sinΩ = hvec[1] / (h * sin(I))
+        cosΩ = -hvec[2] / (h * sin(I))
+        Ω = atan(sinΩ, cosΩ)
+    else
+        Ω = 0.0
+    end
 
     # (2.138)
-    sin_ω_plus_f = x[3] / (R * sin(I))
-    cos_ω_plus_f = (1 / cos(Ω)) * (x[1] / R + sin(Ω) * sin_ω_plus_f * cos(I))
-    ω_plus_f = atan(sin_ω_plus_f, cos_ω_plus_f)
+    if abs(I) >= 1e-8
+        sin_ω_plus_f = x[3] / (R * sin(I))
+        cos_ω_plus_f = (1 / cos(Ω)) * (x[1] / R + sin(Ω) * sin_ω_plus_f * cos(I))
+        ω_plus_f = atan(sin_ω_plus_f, cos_ω_plus_f)
+    else
+        ω_plus_f = atan(x[2], x[1])
+    end
+
+    # ω_plus_f = atan(x[2], x[1])
 
     # (2.139) assuming Rdot = (x.v)/R which is projection of velocity in radial direction
     sinf = a * (1 - e^2) * dot(x, v) / (h * e * R)
@@ -95,16 +105,66 @@ function normvec(x::Vector{T}, v::Vector{T}, Gm::T) where T <: AbstractFloat
     return nvec
 end
 
-function get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: AbstractFloat
+function get_relative_masses(ic::InitialConditions)
+    N = length(ic.m)
+    M = zeros(N-1)
+    G = 39.4845/(365.242 * 365.242) # AU^3 Msol^-1 Day^-2
+    Hmat = hierarchy([N, ones(Int64,N-1)...])
+    for i in 1:N-1
+        for j in 1:N
+            M[i] += abs(Hmat[i,j])*ic.m[j]
+            # M[i] += abs(ic.ϵ[i,j])*ic.m[j]
+        end
+    end
+
+    return G .* M
+end
+
+function get_relative_masses(masses::Vector{T}) where T <: Real
+    masses = vcat(1., masses)
+    N = length(masses)
+    M = zeros(N-1)
+    G = 39.4845/(365.242 * 365.242) # AU^3 Msol^-1 Day^-2
+    Hmat = hierarchy([N, ones(Int64,N-1)...])
+    for i in 1:N-1
+        for j in 1:N
+            M[i] += abs(Hmat[i,j])*masses[j]
+            # M[i] += abs(ic.ϵ[i,j])*ic.m[j]
+        end
+    end
+
+    return G .* M
+end
+
+""" Calculate the relative positions from the A-Matrix. """
+function get_relative_positions(x,v,ic::InitialConditions)
+    n = ic.nbody
+    Hmat = hierarchy([n, ones(Int64,n-1)...])
+    amat = amatrix(Hmat, ic.m)
+    
+    X = zeros(3,n)
+    V = zeros(3,n)
+
+    X .= permutedims(amat*x')
+    V .= permutedims(amat*v')
+
+    return Point(X), Point(V)
+end
+
+
+function get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: Real
     elems = Elements{T}[]
     μs = get_relative_masses(ic)
     X, V = get_relative_positions(s.x, s.v, ic)
     X = point2vector.(X)
     V = point2vector.(V)
+    n = ic.nbody
+    Hmat = hierarchy([n, ones(Int64,n-1)...])
+
     push!(elems, Elements(m=ic.m[1]))  # Central body
     i = 1; b = 0
     while i < ic.nbody
-        if first(ic.ϵ[i, :]) == zero(T)
+        if first(Hmat[i, :]) == zero(T)
             b += 1
         end
         a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[i+b], V[i+b], μs[i+b], s.t[1])
@@ -119,15 +179,19 @@ function get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: 
     return elems
 end
 
-function get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: AbstractFloat
+function get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: Real
     anoms = Vector{T}[]
     μs = get_relative_masses(ic)
     X, V = get_relative_positions(s.x, s.v, ic)
     X = point2vector.(X)
     V = point2vector.(V)
+
+    n = ic.nbody
+    Hmat = hierarchy([n, ones(Int64,n-1)...])
+
     i = 1; b = 0
     while i < ic.nbody
-        if first(ic.ϵ[i, :]) == zero(T)
+        if first(Hmat[i, :]) == zero(T)
             b += 1
         end
         a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[i+b], V[i+b], μs[i+b], s.t[1])
@@ -141,3 +205,4 @@ function get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: Abstrac
     end
     return anoms
 end
+
