@@ -11,9 +11,18 @@ using ForwardDiff
 Orbit object encapsulates the information about `State` and `InittialConditions` of the system
 
 # Fields
-- `s::State` : `State` object of the system
+- `s::State` : `State` object of the system.
 - `ic::InitialConditions` : `InitialConditions` object of the system.
-- `nplanet::Int` : The number of the planets in the system
+- `κ::T` : The κ constant for a family of the periodic orbit.
+- `nplanet::Int` : The number of the planets in the system.
+
+- `jac_1::Matrix{T}` : The Jacobian for Orbital elements to Cartesian conversion
+- `jac_2::Matrix{T}` : The Jacobian for Time Evolution (imported from `NbodyGradient.jl`)
+- `jac_3::Matrix{T}` : The Jacobian for Cartesian to Orbital elements conversion
+- `jac_combined::Matrix{T}` : The combined Jacobian of the final elements w.r.t. initial elements
+
+- `final_elem::Vector{T}` : The final orbital elements after `tsys`
+- `state_final::State` : The `State` structure corresponding to `final_elem`
 """
 mutable struct Orbit{T<:Real}
     s::State
@@ -23,13 +32,20 @@ mutable struct Orbit{T<:Real}
 
     jac_1::Matrix{T} # Orbital elements to Cartesian
     jac_2::Matrix{T} # Time evolution
+    jac_3::Matrix{T} # Cartesian back to final orbital elements
+    jac_combined::Matrix{T} # Combined jacobian J3 * J2 * J1
 
-    function Orbit(s::State, ic::InitialConditions, κ::T, jac_1::Matrix{T}, jac_2::Matrix{T}) where T <: Real
+    final_elem::Vector{T}
+    state_final::State # State after integration for testing only
+
+    function Orbit(s::State, ic::InitialConditions, κ::T, jac_1::Matrix{T}, jac_2::Matrix{T}, jac_3::Matrix{T}, final_elem::Vector{T}, state_final::State) where T <: Real
 
         # Gets the number of planets
         nplanet = ic.nbody - 1
+
+        jac_combined = jac_3 * jac_2 * jac_1
     
-        new{T}(s, ic, κ, nplanet, jac_1, jac_2)
+        new{T}(s, ic, κ, nplanet, jac_1, jac_2, jac_3, jac_combined, final_elem, state_final)
     end
 end
 
@@ -148,7 +164,9 @@ orbparams = OrbitParameters([3e-6, 5e-6, 7e-5, 3e-5], [0.5, 0.5], 2.000, 8*365.2
 orbit = Orbit(4, optparams, orbparams)
 ```
 
-Access `State` and `InitialConditions` using `orbit.s` and `orbit.ic`, respectively.
+Access `State` and `InitialConditions` using `orbit.s` and `orbit.ic`, respectively. 
+The Jacobians of the optimization can be called from fields `jac_1`, `jac_2`, `jac_3`, and `jac_combined`.
+The final orbital elements and its `State` can also be called from `Orbit` structure.
 """
 Orbit(n::Int, optparams::OptimParameters{T}, orbparams::OrbitParameters{U}) where {T <: Real, U <: Real} = begin
 
@@ -162,7 +180,7 @@ Orbit(n::Int, optparams::OptimParameters{T}, orbparams::OrbitParameters{U}) wher
 
     ic_mat = vcat(vcat(1., orbparams.mass)', vcat(positions, velocities))
 
-    ic = CartesianIC(0., n+1, permutedims(ic_mat))
+    ic = CartesianIC(convert(T, 0.), n+1, permutedims(ic_mat))
     s = State(ic)
 
     # Compute derivatives (Jac 1)
@@ -171,12 +189,16 @@ Orbit(n::Int, optparams::OptimParameters{T}, orbparams::OrbitParameters{U}) wher
     # Compute time evolution Jacobian (Jac 2)
     jac_2, s_final = calculate_jac_time_evolution(deepcopy(s), orbparams.tsys, optparams.inner_period)
 
-    println(extract_elements(s_final, ic, orbparams))
+    # Export the elements for testing later
+    final_elem = extract_elements(deepcopy(s_final), ic, orbparams)
 
-    Orbit(s, ic, orbparams.κ, jac_1, jac_2)
+    # Compute derivatives (Jac 3)
+    jac_3 = compute_jac_final(s_final, ic, orbparams)
+
+    Orbit(s, ic, orbparams.κ, jac_1, jac_2, jac_3, final_elem, s_final)
 end
 
-"""Calculate the system initialization based on optvec (a plain, vectorized version of OptimParameters object)"""
+"""Calculate periods, mean anomalies, and longitudes of periastron based on optvec (a plain, vectorized version of OptimParameters object). These quantities will be used to initialize the `Orbit` structure."""
 function compute_system_init(optvec::Vector{T}, orbparams::OrbitParameters{U}) where {T <: Real, U <: Real}
 
     n = length(orbparams.mass)
@@ -254,21 +276,23 @@ function calculate_jac_time_evolution(state::State{T}, tsys::T, inn_period::T) w
         state.t[1] = t_initial + (i * h)
     end        
 
+    # Integrator(ahl21!, convert(T, 1.), convert(T, 0.), tsys)(state)
+
     # Return the time evolution jacobian (Jacobian 2)
     return copy(state.jac_step), state
 end
 
 
 """Extract optimization state parameters from `State` and `InitialConditions`"""
-function extract_elements(s::State{T}, ic::InitialConditions{T}, orbparams::OrbitParameters{T}) where T <: Real 
-    nplanet = ic.nbody - 1
+function extract_elements(x::Matrix{T}, v::Matrix{T}, masses::Vector{T}, orbparams) where T <: Real
+    nplanet = length(masses) - 1
 
     # Extract orbital elements and anomalies
-    elems = get_orbital_elements(s, ic)
-    anoms = get_anomalies(s, ic)
+    elems = get_orbital_elements(x, v, masses)
+    anoms = get_anomalies(x, v, masses)
 
     e = [elems[i].e for i in eachindex(elems)[2:end]]
-    M = [anoms[i][2] for i in eachindex(anoms)]
+    M = [anoms[i][2] for i in eachindex(anoms)[2:end]]
     ωdiff = [elems[i].ω - elems[i-1].ω for i in eachindex(elems)[3:end]]
 
     # Period ratio deviation
@@ -283,6 +307,27 @@ function extract_elements(s::State{T}, ic::InitialConditions{T}, orbparams::Orbi
     inner_period = elems[2].P
 
     return vcat(e, M, ωdiff, pratiodev, inner_period)
+end
+
+# Allow calling the function using `State` and `ic` instead of Cartesians
+extract_elements(s::State{T}, ic::InitialConditions{T}, orbparams::OrbitParameters{T}) where T <: Real = extract_elements(s.x, s.v, ic.m, orbparams)
+
+"""Compute Jacobian 3 (Cartesians back to orbital elements)"""
+function compute_jac_final(s::State{T}, ic::InitialConditions{T}, orbparams::OrbitParameters{T}) where T <: Real
+    input_mat = vcat(s.x, s.v, ic.m')
+
+    # Function for Jacobian 3
+    function f(input)
+        xx = input[1:3,:]
+        vv = input[4:6,:]
+        masses = input[7,:]
+
+        return extract_elements(xx, vv, masses, orbparams)
+    end
+
+    J = ForwardDiff.jacobian(f, input_mat)
+
+    return J
 end
 
 

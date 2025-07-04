@@ -92,19 +92,7 @@ function convert_to_elements(x::Vector{T}, v::Vector{T}, Gm::T, t::T) where T <:
     )
 end
 
-
-function normvec(x::Vector{T}, v::Vector{T}, Gm::T) where T <: AbstractFloat
-    # TODO: Need more comprehensive testing
-    r = mag(x)
-    hvec = cross(x, v)
-    evec = (cross(v, hvec) / Gm) .- (x / r)
-
-    # Unnormalized normal vector
-    nvec = cross(evec, x)
-
-    return nvec
-end
-
+# TODO: Properly deprecate this function as we no longer use `ic` as an argument
 function get_relative_masses(ic::InitialConditions)
     N = length(ic.m)
     M = zeros(N-1)
@@ -120,55 +108,59 @@ function get_relative_masses(ic::InitialConditions)
     return G .* M
 end
 
+"""Calculate the Heliocentric relative mass of each planet."""
 function get_relative_masses(masses::Vector{T}) where T <: Real
-    masses = vcat(1., masses)
-    N = length(masses)
-    M = zeros(N-1)
     G = 39.4845/(365.242 * 365.242) # AU^3 Msol^-1 Day^-2
-    Hmat = hierarchy([N, ones(Int64,N-1)...])
-    for i in 1:N-1
-        for j in 1:N
-            M[i] += abs(Hmat[i,j])*masses[j]
-            # M[i] += abs(ic.ϵ[i,j])*ic.m[j]
-        end
-    end
 
-    return G .* M
+    return [1. + masses[i] for i in eachindex(masses)[2:end]] .* G
 end
 
-""" Calculate the relative positions from the A-Matrix. """
-function get_relative_positions(x,v,ic::InitialConditions)
-    n = ic.nbody
-    Hmat = hierarchy([n, ones(Int64,n-1)...])
-    amat = amatrix(Hmat, ic.m)
-    
-    X = zeros(3,n)
-    V = zeros(3,n)
+"""Calculate the Heliocentrc relative positions of each planet."""
+function get_relative_positions(x,v)
+    X = x[:,2:end] .- x[:,1]
+    V = v[:,2:end] .- v[:,1]
 
-    X .= permutedims(amat*x')
-    V .= permutedims(amat*v')
-
-    return Point(X), Point(V)
+    return X, V
 end
 
+"""
+A structure to store orbital elements as `NbodyGradient.Elements` cannot handle `Real` types.
+"""
+struct RealElements{T <: Real}
+    m::T
+    P::T
+    t0::T
+    ecosω::T
+    esinω::T
+    I::T
+    Ω::T
+    a::T
+    e::T
+    ω::T
+    tp::T
+end
 
-function get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: Real
-    elems = Elements{T}[]
-    μs = get_relative_masses(ic)
-    X, V = get_relative_positions(s.x, s.v, ic)
-    X = point2vector.(X)
-    V = point2vector.(V)
-    n = ic.nbody
+# TODO: Quality of life improvement: Implement fancy showing of the elements
+
+# Special function for the primary body
+RealElements(m::T) where T <: Real = RealElements(m, zeros(T, 10)...)
+
+function get_orbital_elements(x::Matrix{T}, v::Matrix{T}, masses::Vector{T}; time=0.) where T <: Real
+    elems = RealElements[]
+    μs = get_relative_masses(masses)
+    X, V = get_relative_positions(x, v)
+    n = length(masses)
     Hmat = hierarchy([n, ones(Int64,n-1)...])
 
-    push!(elems, Elements(m=ic.m[1]))  # Central body
+    push!(elems, RealElements(masses[1]))  # Central body
     i = 1; b = 0
-    while i < ic.nbody
+    while i < length(masses)
         if first(Hmat[i, :]) == zero(T)
             b += 1
         end
-        a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[i+b], V[i+b], μs[i+b], s.t[1])
-        push!(elems, Elements(ic.m[i+1], 2π / n, 0.0, e*cos(ω), e*sin(ω), I, Ω, a, e, ω, τ))
+        a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[:,i+b], V[:,i+b], μs[i+b], convert(T, time))
+        # TODO: Make sure if these conversions are a good thing to do...?
+        push!(elems, RealElements(masses[i+1], 2π / n, convert(T, 0.0), e*cos(ω), e*sin(ω), I, convert(T, Ω), a, e, ω, τ))
         if b > 0
             b -= 2
         elseif b < 0
@@ -179,22 +171,22 @@ function get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: 
     return elems
 end
 
-function get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: Real
-    anoms = Vector{T}[]
-    μs = get_relative_masses(ic)
-    X, V = get_relative_positions(s.x, s.v, ic)
-    X = point2vector.(X)
-    V = point2vector.(V)
+# Allow calling the function using `State` and `ic` instead of Cartesians
+get_orbital_elements(s::State{T}, ic::InitialConditions{T}) where T <: Real = get_orbital_elements(s.x, s.v, ic.m; time=s.t[1])
 
-    n = ic.nbody
+function get_anomalies(x::Matrix{T}, v::Matrix{T}, masses::Vector{T}; time=0.) where T <: Real
+    anoms = Vector[]
+    μs = get_relative_masses(masses)
+    X, V = get_relative_positions(x, v)
+    n = length(masses)
     Hmat = hierarchy([n, ones(Int64,n-1)...])
 
     i = 1; b = 0
-    while i < ic.nbody
+    while i < length(masses)
         if first(Hmat[i, :]) == zero(T)
             b += 1
         end
-        a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[i+b], V[i+b], μs[i+b], s.t[1])
+        a, e, I, Ω, ω, f, M, E, τ, n, h = convert_to_elements(X[:,i+b], V[:,i+b], μs[i+b], convert(T, time))
         push!(anoms, [f, M, E])
         if b > 0
             b -= 2
@@ -205,4 +197,7 @@ function get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: Real
     end
     return anoms
 end
+
+# Allow calling the function using `State` and `ic` instead of Cartesians
+get_anomalies(s::State{T}, ic::InitialConditions{T}) where T <: Real = get_anomalies(s.x, s.v, ic.m; time=s.t[1])
 

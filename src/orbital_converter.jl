@@ -27,7 +27,9 @@ function orbital_to_cartesian(masses::Vector{U}, periods::Vector{T}, mean_anomal
     positions = zeros(T,3, n_planets)
     velocities = zeros(T,3, n_planets)
 
-    rel_mass = get_relative_masses(masses)
+    # rel_mass = get_relative_masses(masses)
+
+    rel_mass = [1. + masses[i] for i in 1:n_planets] .* 39.4845/(365.242 * 365.242)
     
     # Convert orbital elements to Cartesian for each planet
     for i in 1:n_planets
@@ -53,7 +55,7 @@ function orbital_to_cartesian(masses::Vector{U}, periods::Vector{T}, mean_anomal
         
         # Velocity in orbital plane
         h = sqrt(rel_mass[i] * a * (1 - eccentricities[i]^2))  # specific angular momentum
-        vx_orb = -h * sin(E) / (r * (1 - eccentricities[i]^2))
+        vx_orb = -h * sin(E) / (r * sqrt(1 - eccentricities[i]^2))
         vy_orb = h * cos(E) / r
 
         # For plane-parallel system, we only need rotation by longitude of periastron
